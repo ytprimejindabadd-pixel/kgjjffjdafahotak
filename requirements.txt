@@ -1,5 +1,6 @@
 fastapi
 uvicorn
 gradio
+duckdb
 httpx
 pydantic
