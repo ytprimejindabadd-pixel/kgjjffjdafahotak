@@ -18,7 +18,7 @@ from io import BytesIO
 # ── Config ──────────────────────────────────────────────────────────────────
 HF_DATASET_URL = os.environ.get(
     "ICMR_HF_DATASET_URL",
-    "https://huggingface.co/datasets/rehuuuu/icrm-hitek-fulldb/resolve/main",
+    "https://huggingface.co/datasets/bronx-ultra/icrm-hitek-full-db-mixed-bucket/resolve/main",
 ).rstrip("/")
 
 PARALLELISM = int(os.environ.get("ICMR_PARALLEL", "2"))
