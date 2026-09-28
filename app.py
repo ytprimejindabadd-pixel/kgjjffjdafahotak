@@ -1,19 +1,17 @@
 from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
 import duckdb
 import os
 import re
-import logging
-import urllib.request
+import threading
 from contextlib import asynccontextmanager
 
-# ---------- Logging ----------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("uvicorn.error")
+app = FastAPI(title="User Search API")
 
-# ---------- Config ----------
-PARQUET_URL = "https://huggingface.co/datasets/tfqdeadlo/Inddatainonefile/resolve/main/users_data.parquet"
-LOCAL_PARQUET = "/tmp/users_data.parquet"
+# -------------------------------------------------
+# DuckDB connection (single conn + lock = safe)
+# -------------------------------------------------
+con = None
+db_lock = threading.Lock()
 
 SEARCH_COLUMNS = {
     "mobile": "mobile",
@@ -23,52 +21,46 @@ SEARCH_COLUMNS = {
 }
 VALID_TYPES = list(SEARCH_COLUMNS.keys())
 
-con = None
-
-# ---------- Lifespan (startup / shutdown) ----------
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global con
-    logger.info("Starting app...")
-
-    # Download parquet to local disk (fast queries)
-    src = PARQUET_URL
-    try:
-        if not os.path.exists(LOCAL_PARQUET):
-            logger.info("Downloading parquet from HuggingFace...")
-            urllib.request.urlretrieve(PARQUET_URL, LOCAL_PARQUET)
-            logger.info(f"Downloaded to {LOCAL_PARQUET}")
-        else:
-            logger.info("Using cached parquet")
-        src = LOCAL_PARQUET
-    except Exception as e:
-        logger.warning(f"Download failed, streaming from remote URL: {e}")
-
-    # DuckDB connection
-    con = duckdb.connect()
-    con.execute("INSTALL httpfs; LOAD httpfs;")
-    con.execute(f"CREATE OR REPLACE VIEW users AS SELECT * FROM read_parquet('{src}')")
-    logger.info("DB ready ✅")
-
-    yield
-
-    con.close()
-    logger.info("Shutdown complete")
-
-
-# ---------- App ----------
-app = FastAPI(lifespan=lifespan, title="User Search API")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+PARQUET_URL = (
+    "https://huggingface.co/datasets/tfqdeadlo/"
+    "Inddatainonefile/resolve/main/users_data.parquet"
 )
 
 
-# ---------- Routes ----------
+# -------------------------------------------------
+# Lifespan: setup DuckDB
+# -------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global con
+    print("🚀 Starting up...")
+    con = duckdb.connect(database=":memory:")
+    con.execute("INSTALL httpfs;")
+    con.execute("LOAD httpfs;")
+    con.execute(
+        f"CREATE OR REPLACE VIEW users AS "
+        f"SELECT * FROM read_parquet('{PARQUET_URL}')"
+    )
+    # Warm-up query so the first request isn't slow
+    try:
+        con.execute("SELECT COUNT(*) FROM users").fetchone()
+        print("✅ DuckDB ready")
+    except Exception as e:
+        print(f"⚠️ Warm-up failed: {e}")
+
+    yield
+
+    print("🛑 Shutting down...")
+    if con:
+        con.close()
+
+
+app.router.lifespan_context = lifespan
+
+
+# -------------------------------------------------
+# Routes
+# -------------------------------------------------
 @app.get("/")
 def home():
     return {
@@ -78,16 +70,45 @@ def home():
             "search": "/search?type=mobile&q=9876543210&limit=100",
             "stats": "/stats",
             "health": "/health",
+            "types": VALID_TYPES,
         },
-        "types": VALID_TYPES,
     }
+
+
+def _search_db(q: str, type_: str, limit: int = 100):
+    try:
+        col = SEARCH_COLUMNS[type_]
+        query = (
+            f"SELECT mobile, name, fname AS father_name, address, circle, "
+            f"alt AS alternate, id AS aadhar, email "
+            f"FROM users WHERE {col} = ? LIMIT ?"
+        )
+        with db_lock:
+            results = con.execute(query, [q, limit]).fetchall()
+
+        if not results:
+            return {"success": False, "message": f"{type_} '{q}' not found"}
+
+        columns = [
+            "mobile", "name", "father_name", "address",
+            "circle", "alternate", "aadhar", "email",
+        ]
+        rows = [dict(zip(columns, row)) for row in results]
+        return {
+            "success": True,
+            "number": q,
+            "total": len(rows),
+            "results": rows,
+        }
+    except Exception as e:
+        return {"success": False, "message": str(e)}
 
 
 @app.get("/search")
 def search(
     q: str = Query(..., description="Search value"),
     type: str = Query("mobile", description=f"Search type: {VALID_TYPES}"),
-    limit: int = Query(100, description="Max results (1-500)"),
+    limit: int = Query(100, description="Max results to return"),
 ):
     q_clean = str(q).strip()
     type_clean = str(type).strip().lower()
@@ -96,68 +117,42 @@ def search(
     if type_clean not in VALID_TYPES:
         return {"success": False, "message": f"Invalid type. Valid: {VALID_TYPES}"}
 
-    # Validation rules
-    rules = {
-        "mobile": (r"^\d{10}$", "Mobile number must be 10 digits"),
-        "alt":    (r"^\d{10}$", "Alternate number must be 10 digits"),
-        "id":     (r"^\d{12}$", "Aadhar ID must be 12 digits"),
-        "email":  (r"^[^@]+@[^@]+\.[^@]+$", "Invalid email format"),
-    }
-    pattern, msg = rules[type_clean]
-    if not re.match(pattern, q_clean):
-        return {"success": False, "message": msg}
+    if type_clean in ("mobile", "alt") and not re.match(r"^\d{10}$", q_clean):
+        return {"success": False, "message": "Mobile number must be 10 digits"}
 
-    try:
-        col = SEARCH_COLUMNS[type_clean]
-        sql = f'''
-            SELECT mobile, name, fname AS father_name, address, circle,
-                   alt AS alternate, id AS aadhar, email
-            FROM users
-            WHERE "{col}" = ?
-            LIMIT ?
-        '''
-        rows_raw = con.execute(sql, [q_clean, limit_clean]).fetchall()
+    if type_clean == "id" and not re.match(r"^\d{12}$", q_clean):
+        return {"success": False, "message": "Aadhar ID must be 12 digits"}
 
-        if not rows_raw:
-            return {"success": False, "message": f"{type_clean} '{q_clean}' not found"}
+    if type_clean == "email" and not re.match(r"^[^@]+@[^@]+\.[^@]+$", q_clean):
+        return {"success": False, "message": "Invalid email format"}
 
-        cols = ["mobile", "name", "father_name", "address", "circle",
-                "alternate", "aadhar", "email"]
-        rows = [dict(zip(cols, r)) for r in rows_raw]
-
-        return {
-            "success": True,
-            "number": q_clean,
-            "total": len(rows),
-            "results": rows,
-        }
-
-    except Exception as e:
-        logger.exception("Search failed")
-        return {"success": False, "message": f"Internal error: {e}"}
+    return _search_db(q_clean, type_clean, limit_clean)
 
 
 @app.get("/stats")
 def stats():
     try:
-        count = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        with db_lock:
+            count = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         return {"status": "success", "total_records": count}
     except Exception as e:
-        logger.exception("Stats failed")
         return {"status": "error", "message": str(e)}
 
 
 @app.get("/health")
 def health():
     try:
-        con.execute("SELECT 1").fetchone()
+        with db_lock:
+            con.execute("SELECT 1").fetchone()
         return {"status": "healthy", "database": "connected"}
-    except Exception as e:
-        return {"status": "unhealthy", "error": str(e)}
+    except Exception:
+        return {"status": "unhealthy"}
 
 
-# ---------- Local run / Render run ----------
+# -------------------------------------------------
+# Local dev (Render uses gunicorn/uvicorn via start cmd)
+# -------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
