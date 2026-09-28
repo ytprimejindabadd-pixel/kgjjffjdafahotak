@@ -1,7 +1,3 @@
 fastapi
-uvicorn
-gradio
-httpx
-pydantic
-pandas
-pyarrow
+uvicorn[standard]
+duckdb
